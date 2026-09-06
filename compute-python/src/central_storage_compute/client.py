@@ -90,14 +90,20 @@ class ComputeClient:
         result = self._download_normal(file_id, target, str(payload["url"]), expected_size, verify_sha256)
         return DownloadResult(result.file_id, result.destination, result.bytes_written, result.sha256, selected_mode)
 
-    def benchmark(self, file_id: str, *, sample_path: str | os.PathLike[str] | None = None) -> dict[str, float | int | str]:
-        scratch = Path(sample_path) if sample_path else Path(tempfile.gettempdir()) / f"csp-benchmark-{file_id}"
-        started = time.perf_counter()
-        result = self.download(file_id, scratch, mode="normal", resume=False)
-        duration = max(time.perf_counter() - started, 0.000001)
-        if sample_path is None:
-            scratch.unlink(missing_ok=True)
-        return {"fileId": result.file_id, "bytes": result.bytes_written, "seconds": duration, "bytesPerSecond": result.bytes_written / duration, "sha256": result.sha256, "mode": result.mode}
+    def benchmark(self, file_id: str, *, sample_path: str | os.PathLike[str] | None = None, max_connections: int | None = None) -> dict[str, float | int | str | list[dict[str, float | int | str]]]:
+        allowed = max(1, min(int(max_connections or 8), 32))
+        candidates = [connections for connections in (1, 4, 8) if connections <= allowed]
+        runs: list[dict[str, float | int | str]] = []
+        for connections in candidates:
+            scratch = Path(sample_path) if sample_path else Path(tempfile.gettempdir()) / f"csp-benchmark-{file_id}-{connections}"
+            started = time.perf_counter()
+            result = self.download(file_id, scratch, mode="normal" if connections == 1 else "parallel", max_connections=connections, resume=False)
+            duration = max(time.perf_counter() - started, 0.000001)
+            runs.append({"connections": connections, "bytes": result.bytes_written, "seconds": duration, "bytesPerSecond": result.bytes_written / duration, "mode": result.mode, "sha256": result.sha256})
+            if sample_path is None:
+                scratch.unlink(missing_ok=True)
+        recommended = max(runs, key=lambda run: (float(run["bytesPerSecond"]), -int(run["connections"])))
+        return {"fileId": file_id, "bytes": int(recommended["bytes"]), "seconds": float(recommended["seconds"]), "bytesPerSecond": float(recommended["bytesPerSecond"]), "sha256": str(recommended["sha256"]), "mode": str(recommended["mode"]), "recommendedConcurrency": int(recommended["connections"]), "runs": runs}
 
     def upload(
         self,

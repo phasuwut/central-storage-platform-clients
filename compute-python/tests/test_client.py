@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from central_storage_compute.client import ComputeClient
 
@@ -58,6 +58,16 @@ class ComputeClientTests(unittest.TestCase):
             completion = client._request.call_args_list[1].args[2]
             self.assertEqual([part["partNumber"] for part in completion["parts"]], [1, 2])
             self.assertEqual([part["etag"] for part in completion["parts"]], ["etag-1", "etag-2"])
+
+    def test_benchmark_respects_connection_limit_and_prefers_fewer_on_tie(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        client.download = Mock(side_effect=lambda _file_id, destination, **kwargs: type("Result", (), {"file_id": "file-1", "destination": Path(destination), "bytes_written": 100, "sha256": "digest", "mode": "normal" if kwargs["max_connections"] == 1 else "parallel"})())
+
+        with patch("central_storage_compute.client.time.perf_counter", side_effect=[0.0, 1.0, 10.0, 11.0]):
+            result = client.benchmark("file-1", max_connections=4)
+
+        self.assertEqual([run["connections"] for run in result["runs"]], [1, 4])
+        self.assertEqual(result["recommendedConcurrency"], 1)
 
 
 if __name__ == "__main__":
