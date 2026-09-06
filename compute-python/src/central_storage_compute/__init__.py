@@ -1,3 +1,3 @@
-from .client import ComputeClient
+from .client import ComputeApiError, ComputeClient, DownloadResult, UploadResult
 
-__all__ = ["ComputeClient"]
+__all__ = ["ComputeApiError", "ComputeClient", "DownloadResult", "UploadResult"]

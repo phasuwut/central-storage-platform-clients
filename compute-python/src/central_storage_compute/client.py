@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import base64
+import mimetypes
 import os
 import tempfile
 import time
@@ -12,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import BinaryIO
+from uuid import uuid4
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,16 @@ class DownloadResult:
     bytes_written: int
     sha256: str
     mode: str = "normal"
+
+
+@dataclass(frozen=True)
+class UploadResult:
+    upload_id: str
+    file_id: str
+    source: Path
+    bytes_read: int
+    sha256: str
+    mode: str
 
 
 class ComputeApiError(RuntimeError):
@@ -85,6 +98,111 @@ class ComputeClient:
         if sample_path is None:
             scratch.unlink(missing_ok=True)
         return {"fileId": result.file_id, "bytes": result.bytes_written, "seconds": duration, "bytesPerSecond": result.bytes_written / duration, "sha256": result.sha256, "mode": result.mode}
+
+    def upload(
+        self,
+        source: str | os.PathLike[str],
+        *,
+        destination: str | None = None,
+        mime_type: str | None = None,
+        mode: str = "auto",
+        max_connections: int | None = None,
+        include_checksum: bool = True,
+    ) -> UploadResult:
+        if mode not in {"auto", "single", "multipart"}:
+            raise ValueError("mode must be auto, single, or multipart")
+        path = Path(source)
+        size = path.stat().st_size
+        digest = _sha256_file(path)
+        checksum = _base64_sha256(path) if include_checksum else None
+        body: dict[str, object] = {"filename": path.name, "sizeBytes": size}
+        if destination:
+            body["destination"] = destination
+        if mime_type or mimetypes.guess_type(path.name)[0]:
+            body["mimeType"] = mime_type or mimetypes.guess_type(path.name)[0]
+        if checksum:
+            body["checksum"] = checksum
+        payload: dict[str, object] | None = None
+        if mode in {"auto", "single"}:
+            try:
+                payload = self._request("POST", "/api/v1/compute/uploads/create", body)
+            except ComputeApiError as error:
+                if mode == "single" or error.code != "MULTIPART_REQUIRED":
+                    raise
+        if payload is not None and str(payload.get("mode")) == "single":
+            self._put_file(str(payload["uploadUrl"]), path, str(payload.get("headers", {}).get("content-type", "")), checksum)
+            completed = self._request("POST", f"/api/v1/compute/uploads/{payload['uploadId']}/complete", {"checksum": checksum} if checksum else {}, idempotency_key=str(uuid4()))
+            return UploadResult(str(payload["uploadId"]), str(completed["fileId"]), path, size, digest, "single")
+        multipart = payload if payload is not None else self._request("POST", "/api/v1/compute/uploads/multipart/create", body)
+        return self._upload_multipart(path, multipart, checksum, digest, max_connections)
+
+    def _upload_multipart(self, path: Path, payload: dict[str, object], checksum: str | None, digest: str, max_connections: int | None) -> UploadResult:
+        upload_id = str(payload["uploadId"])
+        part_size = _as_int(payload.get("partSizeBytes")) or 8 * 1024 * 1024
+        total_parts = _as_int(payload.get("totalParts")) or ((path.stat().st_size + part_size - 1) // part_size)
+        concurrency = max(1, min(int(max_connections or payload.get("maxConcurrency") or 4), 32))
+        signed: dict[int, str] = {}
+        for offset in range(0, total_parts, 500):
+            numbers = list(range(offset + 1, min(total_parts, offset + 500) + 1))
+            response = self._request("POST", f"/api/v1/compute/uploads/{upload_id}/multipart/parts/sign", {"partNumbers": numbers})
+            for item in response.get("parts", []):
+                signed[int(item["partNumber"])] = str(item["uploadUrl"])
+
+        def put(part_number: int) -> tuple[int, str]:
+            start = (part_number - 1) * part_size
+            length = min(part_size, path.stat().st_size - start)
+            last_error: Exception | None = None
+            for attempt in range(self.retry_count):
+                try:
+                    with path.open("rb") as source:
+                        source.seek(start)
+                        body = source.read(length)
+                    etag = self._put_bytes(signed[part_number], body)
+                    return part_number, etag
+                except (urllib.error.URLError, TimeoutError, OSError) as error:
+                    last_error = error
+                    if attempt + 1 < self.retry_count:
+                        time.sleep(min(2**attempt, 4))
+            raise RuntimeError(f"Multipart part {part_number} failed") from last_error
+
+        try:
+            parts: list[tuple[int, str]] = []
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [pool.submit(put, part_number) for part_number in range(1, total_parts + 1)]
+                for future in as_completed(futures):
+                    parts.append(future.result())
+            completed = self._request("POST", f"/api/v1/compute/uploads/{upload_id}/multipart/complete", {"parts": [{"partNumber": number, "etag": etag} for number, etag in sorted(parts)], **({"checksum": checksum} if checksum else {})}, idempotency_key=str(uuid4()))
+        except Exception:
+            self._request("POST", f"/api/v1/compute/uploads/{upload_id}/multipart/abort", {})
+            raise
+        return UploadResult(upload_id, str(completed["fileId"]), path, path.stat().st_size, digest, "multipart")
+
+    def _put_file(self, url: str, path: Path, content_type: str, checksum: str | None) -> None:
+        headers = {"Content-Length": str(path.stat().st_size)}
+        if content_type:
+            headers["Content-Type"] = content_type
+        if checksum:
+            headers["x-amz-checksum-sha256"] = checksum
+        request = urllib.request.Request(url, method="PUT", headers=headers)
+        with path.open("rb") as source:
+            request.data = source
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    if response.status < 200 or response.status >= 300:
+                        raise RuntimeError(f"Compute upload failed ({response.status})")
+            except urllib.error.HTTPError as error:
+                raise RuntimeError(f"Compute upload failed ({error.code})") from error
+
+    @staticmethod
+    def _put_bytes(url: str, body: bytes) -> str:
+        request = urllib.request.Request(url, data=body, method="PUT", headers={"Content-Length": str(len(body))})
+        try:
+            with urllib.request.urlopen(request) as response:
+                if response.status < 200 or response.status >= 300:
+                    raise RuntimeError(f"Compute multipart upload failed ({response.status})")
+                return response.headers.get("ETag", "").strip('"')
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(f"Compute multipart upload failed ({error.code})") from error
 
     def _download_normal(self, file_id: str, target: Path, url: str, expected_size: int | None, verify_sha256: str | None) -> DownloadResult:
         last_error: Exception | None = None
@@ -219,3 +337,19 @@ def _as_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _base64_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return base64.b64encode(digest.digest()).decode("ascii")
