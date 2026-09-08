@@ -10,7 +10,7 @@ This repository is consumed by the API repository as a Git submodule at `clients
 
 ## Releasing
 
-Each client versions and tags on its own; see the client's own README for the procedure. Tags are prefixed by client (`compute-client-v0.1.1`) so one client's release never triggers another's workflow.
+Each client versions and tags on its own; see the client's own README for the procedure. Tags are prefixed by client (`compute-client-v0.1.2`) so one client's release never triggers another's workflow.
 
 ## License
 

@@ -39,11 +39,13 @@ class UploadResult:
 class ComputeApiError(RuntimeError):
     """Safe API error that never includes a bearer token or presigned URL."""
 
-    def __init__(self, status: int, code: str, message: str) -> None:
-        super().__init__(f"Compute API request failed ({status}): {code}")
+    def __init__(self, status: int, code: str, message: str, request_id: str | None = None) -> None:
+        detail = f"Compute API request failed ({status}): {code} — {message}"
+        super().__init__(f"{detail} [request ID: {request_id}]" if request_id else detail)
         self.status = status
         self.code = code
         self.message = message
+        self.request_id = request_id
 
 
 class _RangeUnsupported(RuntimeError):
@@ -328,14 +330,7 @@ class ComputeClient:
                     raise RuntimeError("Compute API returned an invalid response")
                 return value
         except urllib.error.HTTPError as error:
-            try:
-                payload = json.load(error)
-                envelope = payload.get("error", {}) if isinstance(payload, dict) else {}
-                code = str(envelope.get("code", "HTTP_ERROR")) if isinstance(envelope, dict) else "HTTP_ERROR"
-                message = str(envelope.get("message", "Request failed")) if isinstance(envelope, dict) else "Request failed"
-            except (ValueError, OSError):
-                code, message = "HTTP_ERROR", "Request failed"
-            raise ComputeApiError(error.code, code, message) from error
+            raise _compute_api_error(error) from error
 
 
 def _as_int(value: object) -> int | None:
@@ -343,6 +338,44 @@ def _as_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _compute_api_error(error: urllib.error.HTTPError) -> ComputeApiError:
+    """Extract only safe, structured API error details from an HTTP failure."""
+    code = "HTTP_ERROR"
+    message = _default_http_error_message(error.code)
+    request_id = _safe_error_text(error.headers.get("X-Request-Id"), "") or None
+    try:
+        payload = json.loads(error.read().decode("utf-8"))
+        envelope = payload.get("error") if isinstance(payload, dict) else None
+        detail = envelope if isinstance(envelope, dict) else payload if isinstance(payload, dict) else {}
+        code = _safe_error_code(detail.get("code"), code)
+        message = _safe_error_text(detail.get("message"), message)
+        request_id = _safe_error_text(detail.get("requestId"), request_id or "") or request_id
+    except (UnicodeDecodeError, ValueError, OSError):
+        pass
+    return ComputeApiError(error.code, code, message, request_id)
+
+
+def _default_http_error_message(status: int) -> str:
+    if status == 401:
+        return "Compute token is invalid, expired, or revoked"
+    if status == 403:
+        return "Request was forbidden; verify the API URL and that compute API traffic is allowed"
+    return "Request failed"
+
+
+def _safe_error_code(value: object, fallback: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    return text if text and len(text) <= 64 and all(char.isupper() or char.isdigit() or char == "_" for char in text) else fallback
+
+
+def _safe_error_text(value: object, fallback: str) -> str:
+    text = " ".join(str(value).split()).strip() if value is not None else ""
+    sensitive_markers = ("cpt_", "x-amz-", "http://", "https://")
+    if not text or len(text) > 300 or any(marker in text.lower() for marker in sensitive_markers):
+        return fallback
+    return text
 
 
 def _sha256_file(path: Path) -> str:

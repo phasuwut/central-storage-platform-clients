@@ -1,8 +1,10 @@
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 from central_storage_compute.client import ComputeClient
 
@@ -27,6 +29,34 @@ class ComputeClientTests(unittest.TestCase):
     def test_token_prefix_is_required(self) -> None:
         with self.assertRaises(ValueError):
             ComputeClient("https://api.example.invalid", "secret")
+
+    def test_structured_http_error_keeps_safe_api_details_and_request_id(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        response = HTTPError(
+            "https://api.example.invalid/api/v1/compute/uploads/create",
+            403,
+            "Forbidden",
+            {"X-Request-Id": "req-header"},
+            BytesIO(b'{"error":{"code":"CSRF_ORIGIN_MISMATCH","message":"Origin is not allowed","requestId":"req-body"}}'),
+        )
+
+        with patch("central_storage_compute.client.urllib.request.urlopen", side_effect=response):
+            with self.assertRaisesRegex(Exception, "CSRF_ORIGIN_MISMATCH.*Origin is not allowed.*req-body") as raised:
+                client._request("POST", "/api/v1/compute/uploads/create", {})
+
+        self.assertEqual(raised.exception.status, 403)
+        self.assertEqual(raised.exception.code, "CSRF_ORIGIN_MISMATCH")
+        self.assertEqual(raised.exception.request_id, "req-body")
+
+    def test_unstructured_forbidden_response_is_actionable_without_leaking_body(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        response = HTTPError("https://api.example.invalid", 403, "Forbidden", {}, BytesIO(b"<html>blocked</html>"))
+
+        with patch("central_storage_compute.client.urllib.request.urlopen", side_effect=response):
+            with self.assertRaisesRegex(Exception, "Request was forbidden; verify the API URL") as raised:
+                client._request("POST", "/api/v1/compute/uploads/create", {})
+
+        self.assertEqual(raised.exception.code, "HTTP_ERROR")
 
     def test_single_upload_uses_compute_namespace_and_completion_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
