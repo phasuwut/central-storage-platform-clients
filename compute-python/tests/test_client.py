@@ -71,19 +71,38 @@ class ComputeClientTests(unittest.TestCase):
             source = Path(directory) / "output.txt"
             source.write_text("hello")
             client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
-            response = HTTPError(
-                "https://bucket.s3.example/presigned-secret-url",
-                403,
-                "Forbidden",
-                {"x-amz-request-id": "header-id"},
-                BytesIO(b"<Error><Code>AccessDenied</Code><RequestId>body-id</RequestId><HostId>secret</HostId></Error>"),
+            response = Mock(
+                status=403,
+                reason="Forbidden",
+                headers={"x-amz-request-id": "header-id"},
             )
+            response.read.return_value = b"<Error><Code>AccessDenied</Code><RequestId>body-id</RequestId><HostId>secret</HostId></Error>"
+            connection = Mock()
+            connection.getresponse.return_value = response
 
-            with patch("central_storage_compute.client.urllib.request.urlopen", side_effect=response):
+            with patch("central_storage_compute.client.http.client.HTTPSConnection", return_value=connection):
                 with self.assertRaisesRegex(RuntimeError, "Compute upload failed \\(403\\): AccessDenied.*body-id") as raised:
                     client._put_file("https://bucket.s3.example/presigned-secret-url", source, "", None)
 
             self.assertNotIn("presigned-secret-url", str(raised.exception))
+
+    def test_single_upload_streams_fixed_length_body_without_chunked_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.txt"
+            source.write_text("hello")
+            client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+            response = Mock(status=200, reason="OK", headers={})
+            response.read.return_value = b""
+            connection = Mock()
+            connection.getresponse.return_value = response
+
+            with patch("central_storage_compute.client.http.client.HTTPSConnection", return_value=connection):
+                client._put_file("https://bucket.s3.example/presigned-secret-url", source, "text/plain", None)
+
+            connection.putheader.assert_any_call("Content-Length", "5")
+            connection.putheader.assert_any_call("Content-Type", "text/plain")
+            connection.send.assert_called_once_with(b"hello")
+            connection.close.assert_called_once()
 
     def test_single_upload_uses_compute_namespace_and_completion_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

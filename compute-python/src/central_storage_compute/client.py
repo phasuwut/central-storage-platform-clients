@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
+import io
 import json
 import base64
 import mimetypes
@@ -188,20 +190,44 @@ class ComputeClient:
         return UploadResult(upload_id, str(completed["fileId"]), path, path.stat().st_size, digest, "multipart")
 
     def _put_file(self, url: str, path: Path, content_type: str, checksum: str | None) -> None:
+        """Stream a single PUT with a fixed Content-Length.
+
+        urllib turns file-like request bodies into chunked transfers on some
+        Python versions. S3 presigned PutObject URLs reject that transfer mode
+        with ``501 NotImplemented``, even though the signature is valid.
+        """
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("upload URL must be an HTTP(S) URL")
         headers = {"Content-Length": str(path.stat().st_size)}
         if content_type:
             headers["Content-Type"] = content_type
         if checksum:
             headers["x-amz-checksum-sha256"] = checksum
-        request = urllib.request.Request(url, method="PUT", headers=headers)
-        with path.open("rb") as source:
-            request.data = source
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    if response.status < 200 or response.status >= 300:
-                        raise RuntimeError(f"Compute upload failed ({response.status})")
-            except urllib.error.HTTPError as error:
-                raise _storage_api_error("Compute upload", error) from error
+        request_path = parsed.path or "/"
+        if parsed.query:
+            request_path = f"{request_path}?{parsed.query}"
+        connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_type(parsed.hostname, parsed.port, timeout=self.timeout)
+        try:
+            connection.putrequest("PUT", request_path)
+            for name, value in headers.items():
+                connection.putheader(name, value)
+            connection.endheaders()
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    connection.send(chunk)
+            response = connection.getresponse()
+            body = response.read()
+            if response.status < 200 or response.status >= 300:
+                error = urllib.error.HTTPError(url, response.status, response.reason, response.headers, io.BytesIO(body))
+                raise _storage_api_error("Compute upload", error)
+        except urllib.error.HTTPError as error:
+            raise _storage_api_error("Compute upload", error) from error
+        except OSError as error:
+            raise RuntimeError("Compute upload request failed") from error
+        finally:
+            connection.close()
 
     @staticmethod
     def _put_bytes(url: str, body: bytes) -> str:
