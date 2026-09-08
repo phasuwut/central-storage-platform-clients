@@ -9,6 +9,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,7 +59,7 @@ class ComputeClient:
     def __init__(self, api_url: str, token: str, timeout: float = 30.0, retry_count: int = 3) -> None:
         if not token.startswith("cpt_"):
             raise ValueError("Compute token must use the cpt_ prefix")
-        self.api_url = api_url.rstrip("/")
+        self.api_url = _normalise_api_url(api_url)
         self._token = token
         self.timeout = timeout
         self.retry_count = max(1, retry_count)
@@ -338,6 +339,17 @@ def _as_int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _normalise_api_url(value: str) -> str:
+    """Accept the API origin, optionally normalising common API path prefixes."""
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError("api_url must be an http(s) API origin without a query or fragment")
+    path = parsed.path.rstrip("/")
+    if path not in {"", "/api/v1", "/api/v1/compute"}:
+        raise ValueError("api_url must be the API origin; do not include /api/v1/compute routes or wildcards")
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
 def _compute_api_error(error: urllib.error.HTTPError) -> ComputeApiError:

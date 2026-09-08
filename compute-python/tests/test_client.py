@@ -30,6 +30,14 @@ class ComputeClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ComputeClient("https://api.example.invalid", "secret")
 
+    def test_api_url_normalises_a_common_api_prefix(self) -> None:
+        client = ComputeClient("https://api.example.invalid/api/v1", "cpt_token.secret")
+        self.assertEqual(client.api_url, "https://api.example.invalid")
+
+    def test_api_url_rejects_compute_route_or_wildcard(self) -> None:
+        with self.assertRaisesRegex(ValueError, "do not include /api/v1/compute routes or wildcards"):
+            ComputeClient("https://api.example.invalid/api/v1/compute/*", "cpt_token.secret")
+
     def test_structured_http_error_keeps_safe_api_details_and_request_id(self) -> None:
         client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
         response = HTTPError(
