@@ -1,13 +1,39 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "central-storage-platform-compute"
-version = "0.1.0"
 description = "Provider-neutral compute transfer client for Central Storage Platform"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "phasuwut", email = "phasuwut.share@gmail.com" }]
+keywords = ["storage", "s3", "transfer", "resume", "multipart", "compute"]
 dependencies = []
+dynamic = ["version"]
+
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Archiving",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://central-storage-platform-api.phasuwut.com"
+
+[tool.setuptools.dynamic]
+version = { attr = "central_storage_compute.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+central_storage_compute = ["py.typed"]
