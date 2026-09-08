@@ -27,7 +27,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://central-storage-platform-api.phasuwut.com"
+Homepage = "https://github.com/phasuwut/central-storage-platform-clients"
+Repository = "https://github.com/phasuwut/central-storage-platform-clients"
+Issues = "https://github.com/phasuwut/central-storage-platform-clients/issues"
 
 [tool.setuptools.dynamic]
 version = { attr = "central_storage_compute.__version__" }
