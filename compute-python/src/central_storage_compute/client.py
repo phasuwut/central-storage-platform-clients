@@ -119,7 +119,7 @@ class ComputeClient:
         mime_type: str | None = None,
         mode: str = "auto",
         max_connections: int | None = None,
-        include_checksum: bool = True,
+        include_checksum: bool = False,
     ) -> UploadResult:
         if mode not in {"auto", "single", "multipart"}:
             raise ValueError("mode must be auto, single, or multipart")

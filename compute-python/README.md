@@ -21,7 +21,7 @@ Pass the API origin only (for example, `https://central-storage-platform-api.pha
 
 `download(mode="auto")` follows the transfer mode and concurrency returned by the API. Use `mode="parallel"` to request bounded HTTP Range workers; the client falls back to streaming mode when the storage endpoint does not support ranges. `upload(mode="auto")` tries the single path and switches to the token-scoped multipart path when the API requires it.
 
-The token is supplied at runtime. The client never writes it or a presigned URL to a resume manifest or log. Resume manifests contain only file identity, expected size/checksum and completed byte ranges. All upload completion calls carry a fresh `Idempotency-Key`.
+The token is supplied at runtime. The client never writes it or a presigned URL to a resume manifest or log. Resume manifests contain only file identity, expected size/checksum and completed byte ranges. All upload completion calls carry a fresh `Idempotency-Key`. Upload checksums are disabled by default for compatibility with S3-compatible presigned PUT endpoints; pass `include_checksum=True` only when the target bucket supports signed `x-amz-checksum-sha256` headers.
 
 ## Releasing
 

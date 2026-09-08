@@ -117,6 +117,7 @@ class ComputeClientTests(unittest.TestCase):
             self.assertEqual(result.file_id, "file-1")
             self.assertEqual(result.bytes_read, 5)
             self.assertEqual(result.mode, "single")
+            self.assertNotIn("checksum", client._request.call_args_list[0].args[2])
             self.assertEqual(client._request.call_args_list[1].args[1], "/api/v1/compute/uploads/upload-1/complete")
             self.assertIn("idempotency_key", client._request.call_args_list[1].kwargs)
 
