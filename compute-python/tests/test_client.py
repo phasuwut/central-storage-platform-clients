@@ -66,6 +66,25 @@ class ComputeClientTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "HTTP_ERROR")
 
+    def test_single_upload_reports_safe_s3_error_code_and_request_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.txt"
+            source.write_text("hello")
+            client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+            response = HTTPError(
+                "https://bucket.s3.example/presigned-secret-url",
+                403,
+                "Forbidden",
+                {"x-amz-request-id": "header-id"},
+                BytesIO(b"<Error><Code>AccessDenied</Code><RequestId>body-id</RequestId><HostId>secret</HostId></Error>"),
+            )
+
+            with patch("central_storage_compute.client.urllib.request.urlopen", side_effect=response):
+                with self.assertRaisesRegex(RuntimeError, "Compute upload failed \\(403\\): AccessDenied.*body-id") as raised:
+                    client._put_file("https://bucket.s3.example/presigned-secret-url", source, "", None)
+
+            self.assertNotIn("presigned-secret-url", str(raised.exception))
+
     def test_single_upload_uses_compute_namespace_and_completion_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "output.txt"

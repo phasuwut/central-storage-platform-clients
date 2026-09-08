@@ -17,7 +17,7 @@ upload = client.upload("./result.bin", destination="results/", mode="auto")
 print(upload.file_id, upload.mode, upload.sha256)
 ```
 
-Pass the API origin only (for example, `https://central-storage-platform-api.phasuwut.com`). Do not include `/api/v1`, `/compute`, a route, or `*`; the client supplies the API path itself.
+Pass the API origin only (for example, `https://central-storage-platform-api.phasuwut.com`). Do not include `/api/v1`, `/compute`, a route, or `*`; the client supplies the API path itself. Storage upload failures report only a safe S3 error code and request ID, never a presigned URL.
 
 `download(mode="auto")` follows the transfer mode and concurrency returned by the API. Use `mode="parallel"` to request bounded HTTP Range workers; the client falls back to streaming mode when the storage endpoint does not support ranges. `upload(mode="auto")` tries the single path and switches to the token-scoped multipart path when the API requires it.
 

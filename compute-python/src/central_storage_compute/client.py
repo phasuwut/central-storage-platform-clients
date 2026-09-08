@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
+from xml.etree import ElementTree
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -200,7 +201,7 @@ class ComputeClient:
                     if response.status < 200 or response.status >= 300:
                         raise RuntimeError(f"Compute upload failed ({response.status})")
             except urllib.error.HTTPError as error:
-                raise RuntimeError(f"Compute upload failed ({error.code})") from error
+                raise _storage_api_error("Compute upload", error) from error
 
     @staticmethod
     def _put_bytes(url: str, body: bytes) -> str:
@@ -211,7 +212,7 @@ class ComputeClient:
                     raise RuntimeError(f"Compute multipart upload failed ({response.status})")
                 return response.headers.get("ETag", "").strip('"')
         except urllib.error.HTTPError as error:
-            raise RuntimeError(f"Compute multipart upload failed ({error.code})") from error
+            raise _storage_api_error("Compute multipart upload", error) from error
 
     def _download_normal(self, file_id: str, target: Path, url: str, expected_size: int | None, verify_sha256: str | None) -> DownloadResult:
         last_error: Exception | None = None
@@ -388,6 +389,25 @@ def _safe_error_text(value: object, fallback: str) -> str:
     if not text or len(text) > 300 or any(marker in text.lower() for marker in sensitive_markers):
         return fallback
     return text
+
+
+def _storage_api_error(operation: str, error: urllib.error.HTTPError) -> RuntimeError:
+    """Expose only an S3 error code/request ID, never the presigned URL or body."""
+    code = "HTTP_ERROR"
+    request_id = _safe_error_text(error.headers.get("x-amz-request-id"), "") or None
+    try:
+        root = ElementTree.fromstring(error.read().decode("utf-8"))
+        code = _safe_storage_error_code(root.findtext("{*}Code"), code)
+        request_id = _safe_error_text(root.findtext("{*}RequestId"), request_id or "") or request_id
+    except (ElementTree.ParseError, UnicodeDecodeError, OSError):
+        pass
+    detail = f"{operation} failed ({error.code}): {code}"
+    return RuntimeError(f"{detail} [request ID: {request_id}]" if request_id else detail)
+
+
+def _safe_storage_error_code(value: object, fallback: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    return text if text and len(text) <= 64 and all(char.isalnum() or char in {"_", "-"} for char in text) else fallback
 
 
 def _sha256_file(path: Path) -> str:
