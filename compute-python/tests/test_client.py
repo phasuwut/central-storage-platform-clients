@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
-from central_storage_compute.client import ComputeClient
+from central_storage_compute.client import ComputeApiError, ComputeClient
 
 
 class ComputeClientTests(unittest.TestCase):
@@ -29,6 +29,25 @@ class ComputeClientTests(unittest.TestCase):
     def test_token_prefix_is_required(self) -> None:
         with self.assertRaises(ValueError):
             ComputeClient("https://api.example.invalid", "secret")
+
+    def test_default_timeout_allows_slow_multipart_completion(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        self.assertEqual(client.timeout, 3_600.0)
+
+    def test_timeout_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timeout must be greater than zero"):
+            ComputeClient("https://api.example.invalid", "cpt_token.secret", timeout=0)
+
+    def test_multipart_part_uses_the_configured_timeout(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret", timeout=600)
+        response = Mock(status=200, headers={})
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+
+        with patch("central_storage_compute.client.urllib.request.urlopen", return_value=response) as open_url:
+            self.assertEqual(client._put_bytes("https://s3.example/part", b"data"), "")
+
+        self.assertEqual(open_url.call_args.kwargs["timeout"], 600)
 
     def test_api_url_normalises_a_common_api_prefix(self) -> None:
         client = ComputeClient("https://api.example.invalid/api/v1", "cpt_token.secret")
@@ -135,6 +154,63 @@ class ComputeClientTests(unittest.TestCase):
             completion = client._request.call_args_list[1].args[2]
             self.assertEqual([part["partNumber"] for part in completion["parts"]], [1, 2])
             self.assertEqual([part["etag"] for part in completion["parts"]], ["etag-1", "etag-2"])
+
+    def test_completion_replays_the_same_key_after_a_read_timeout(self) -> None:
+        """A slow server-side finalization must not look like a failed upload."""
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        client._request = Mock(side_effect=[TimeoutError("read timed out"), {"fileId": "file-1"}])
+
+        with patch("central_storage_compute.client.time.sleep") as sleep:
+            result = client._complete("/api/v1/compute/uploads/upload-1/multipart/complete", "upload-1", {}, abort=True)
+
+        self.assertEqual(result, {"fileId": "file-1"})
+        self.assertEqual(sleep.call_count, 1)
+        keys = {call.kwargs["idempotency_key"] for call in client._request.call_args_list}
+        self.assertEqual(len(keys), 1, "the replay must reuse the original Idempotency-Key")
+        self.assertNotIn("/multipart/abort", [call.args[1] for call in client._request.call_args_list])
+
+    def test_completion_waits_while_the_api_reports_work_in_progress(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        in_progress = ComputeApiError(409, "IDEMPOTENCY_IN_PROGRESS", "still working")
+        client._request = Mock(side_effect=[in_progress, {"fileId": "file-1"}])
+
+        with patch("central_storage_compute.client.time.sleep"):
+            result = client._complete("/api/v1/compute/uploads/upload-1/multipart/complete", "upload-1", {}, abort=True)
+
+        self.assertEqual(result, {"fileId": "file-1"})
+        self.assertNotIn("/multipart/abort", [call.args[1] for call in client._request.call_args_list])
+
+    def test_completion_aborts_only_when_the_api_rejects_the_upload(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        rejection = ComputeApiError(409, "MULTIPART_PARTS_INCOMPLETE", "All multipart parts are required")
+        client._request = Mock(side_effect=[rejection, {"uploadId": "upload-1", "status": "CANCELLED"}])
+
+        with self.assertRaises(ComputeApiError):
+            client._complete("/api/v1/compute/uploads/upload-1/multipart/complete", "upload-1", {}, abort=True)
+
+        self.assertEqual(client._request.call_args_list[1].args[1], "/api/v1/compute/uploads/upload-1/multipart/abort")
+
+    def test_completion_gives_up_without_discarding_the_uploaded_parts(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret", timeout=0.01)
+        client._request = Mock(side_effect=TimeoutError("read timed out"))
+
+        with patch("central_storage_compute.client.time.sleep"), self.assertRaisesRegex(TimeoutError, "still finalizing"):
+            client._complete("/api/v1/compute/uploads/upload-1/multipart/complete", "upload-1", {}, abort=True)
+
+        self.assertNotIn("/multipart/abort", [call.args[1] for call in client._request.call_args_list])
+
+    def test_multipart_aborts_when_a_part_upload_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abcde")
+            client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+            client._request = Mock(side_effect=[{"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/1"}]}, {"uploadId": "upload-1", "status": "CANCELLED"}])
+            client._put_bytes = Mock(side_effect=OSError("connection reset"))
+
+            with patch("central_storage_compute.client.time.sleep"), self.assertRaises(RuntimeError):
+                client._upload_multipart(source, {"uploadId": "upload-1", "partSizeBytes": 8, "totalParts": 1, "maxConcurrency": 1}, None, "digest", 1)
+
+            self.assertEqual(client._request.call_args_list[-1].args[1], "/api/v1/compute/uploads/upload-1/multipart/abort")
 
     def test_benchmark_respects_connection_limit_and_prefers_fewer_on_tie(self) -> None:
         client = ComputeClient("https://api.example.invalid", "cpt_token.secret")

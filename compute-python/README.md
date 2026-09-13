@@ -17,6 +17,12 @@ upload = client.upload("./result.bin", destination="results/", mode="auto")
 print(upload.file_id, upload.mode, upload.sha256)
 ```
 
+The client waits up to one hour for each API or storage request by default, and a completion that outlives a single request is replayed under its original `Idempotency-Key` until the API reports a result — a read timeout while the server finalizes a multi-gigabyte object never discards the uploaded bytes. Only an outright rejection from the API aborts a multipart upload. For a slow network or an exceptionally large finalization, set a different per-request limit when creating the client:
+
+```python
+client = ComputeClient("https://api.example.invalid", token="cpt_<show-once-token>", timeout=7_200)
+```
+
 Pass the API origin only (for example, `https://central-storage-platform-api.phasuwut.com`). Do not include `/api/v1`, `/compute`, a route, or `*`; the client supplies the API path itself. Storage upload failures report only a safe S3 error code and request ID, never a presigned URL.
 
 `download(mode="auto")` follows the transfer mode and concurrency returned by the API. Use `mode="parallel"` to request bounded HTTP Range workers; the client falls back to streaming mode when the storage endpoint does not support ranges. `upload(mode="auto")` tries the single path and switches to the token-scoped multipart path when the API requires it.

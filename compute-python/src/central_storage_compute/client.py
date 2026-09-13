@@ -59,9 +59,21 @@ class _RangeUnsupported(RuntimeError):
 class ComputeClient:
     """Provider-neutral client; credentials and presigned URLs stay out of manifests/logs."""
 
-    def __init__(self, api_url: str, token: str, timeout: float = 30.0, retry_count: int = 3) -> None:
+    # Completing a multipart upload can involve S3 finalization and a server-side
+    # copy before the API can return the final file ID.  Thirty seconds is too
+    # short for multi-gigabyte objects, so use a one-hour client timeout by
+    # default—the same lifetime as a Compute token—while still allowing callers
+    # to choose a longer limit.
+    DEFAULT_TIMEOUT_SECONDS = 3_600.0
+
+    # Upper bound on the backoff between completion replays.
+    COMPLETE_POLL_MAX_SECONDS = 15.0
+
+    def __init__(self, api_url: str, token: str, timeout: float = DEFAULT_TIMEOUT_SECONDS, retry_count: int = 3) -> None:
         if not token.startswith("cpt_"):
             raise ValueError("Compute token must use the cpt_ prefix")
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
         self.api_url = _normalise_api_url(api_url)
         self._token = token
         self.timeout = timeout
@@ -143,8 +155,9 @@ class ComputeClient:
                     raise
         if payload is not None and str(payload.get("mode")) == "single":
             self._put_file(str(payload["uploadUrl"]), path, str(payload.get("headers", {}).get("content-type", "")), checksum)
-            completed = self._request("POST", f"/api/v1/compute/uploads/{payload['uploadId']}/complete", {"checksum": checksum} if checksum else {}, idempotency_key=str(uuid4()))
-            return UploadResult(str(payload["uploadId"]), str(completed["fileId"]), path, size, digest, "single")
+            upload_id = str(payload["uploadId"])
+            completed = self._complete(f"/api/v1/compute/uploads/{upload_id}/complete", upload_id, {"checksum": checksum} if checksum else {}, abort=False)
+            return UploadResult(upload_id, str(completed["fileId"]), path, size, digest, "single")
         multipart = payload if payload is not None else self._request("POST", "/api/v1/compute/uploads/multipart/create", body)
         return self._upload_multipart(path, multipart, checksum, digest, max_connections)
 
@@ -183,11 +196,57 @@ class ComputeClient:
                 futures = [pool.submit(put, part_number) for part_number in range(1, total_parts + 1)]
                 for future in as_completed(futures):
                     parts.append(future.result())
-            completed = self._request("POST", f"/api/v1/compute/uploads/{upload_id}/multipart/complete", {"parts": [{"partNumber": number, "etag": etag} for number, etag in sorted(parts)], **({"checksum": checksum} if checksum else {})}, idempotency_key=str(uuid4()))
         except Exception:
-            self._request("POST", f"/api/v1/compute/uploads/{upload_id}/multipart/abort", {})
+            self._abort_multipart(upload_id)
             raise
+
+        body = {"parts": [{"partNumber": number, "etag": etag} for number, etag in sorted(parts)], **({"checksum": checksum} if checksum else {})}
+        completed = self._complete_multipart(upload_id, body)
         return UploadResult(upload_id, str(completed["fileId"]), path, path.stat().st_size, digest, "multipart")
+
+    def _complete_multipart(self, upload_id: str, body: dict[str, object]) -> dict[str, object]:
+        return self._complete(f"/api/v1/compute/uploads/{upload_id}/multipart/complete", upload_id, body, abort=True)
+
+    def _complete(self, path: str, upload_id: str, body: dict[str, object], *, abort: bool) -> dict[str, object]:
+        """Complete an upload, surviving a slow finalization on the API side.
+
+        Completing asks the API to finish the S3 upload and move the object into
+        place, which for a multi-gigabyte file can outlast a single HTTP request.
+        A read timeout therefore says nothing about whether the upload failed, so
+        the same Idempotency-Key is replayed until the API reports a result: the
+        server either returns the stored response or tells us it is still working.
+        Aborting on a timeout would discard a transfer that is very likely
+        succeeding, so only an outright rejection from the API aborts the upload.
+        """
+        idempotency_key = str(uuid4())
+        deadline = time.monotonic() + self.timeout
+        attempt = 0
+        while True:
+            try:
+                return self._request("POST", path, body, idempotency_key=idempotency_key)
+            except ComputeApiError as error:
+                if error.code != "IDEMPOTENCY_IN_PROGRESS":
+                    if abort:
+                        self._abort_multipart(upload_id)
+                    raise
+            except (TimeoutError, urllib.error.URLError, http.client.HTTPException, OSError):
+                # The finalization may still be running; fall through and replay.
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Upload {upload_id} is still finalizing after {self.timeout:.0f}s. "
+                    "The bytes are uploaded; retry the completion instead of re-uploading."
+                )
+            attempt += 1
+            time.sleep(min(2**attempt, self.COMPLETE_POLL_MAX_SECONDS))
+
+    def _abort_multipart(self, upload_id: str) -> None:
+        try:
+            self._request("POST", f"/api/v1/compute/uploads/{upload_id}/multipart/abort", {})
+        except ComputeApiError:
+            # The upload may already be completed or cancelled; the original
+            # failure is the one worth reporting.
+            pass
 
     def _put_file(self, url: str, path: Path, content_type: str, checksum: str | None) -> None:
         """Stream a single PUT with a fixed Content-Length.
@@ -229,11 +288,10 @@ class ComputeClient:
         finally:
             connection.close()
 
-    @staticmethod
-    def _put_bytes(url: str, body: bytes) -> str:
+    def _put_bytes(self, url: str, body: bytes) -> str:
         request = urllib.request.Request(url, data=body, method="PUT", headers={"Content-Length": str(len(body))})
         try:
-            with urllib.request.urlopen(request) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 if response.status < 200 or response.status >= 300:
                     raise RuntimeError(f"Compute multipart upload failed ({response.status})")
                 return response.headers.get("ETag", "").strip('"')
