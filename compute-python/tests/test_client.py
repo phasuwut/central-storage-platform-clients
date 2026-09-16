@@ -6,7 +6,13 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
-from central_storage_compute.client import ComputeApiError, ComputeClient
+from central_storage_compute.client import (
+    ComputeApiError,
+    ComputeClient,
+    _KeepAliveConnections,
+    _PartSigner,
+    _StorageRequestError,
+)
 
 
 class ComputeClientTests(unittest.TestCase):
@@ -40,14 +46,56 @@ class ComputeClientTests(unittest.TestCase):
 
     def test_multipart_part_uses_the_configured_timeout(self) -> None:
         client = ComputeClient("https://api.example.invalid", "cpt_token.secret", timeout=600)
-        response = Mock(status=200, headers={})
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=None)
+        pool = _KeepAliveConnections(client.timeout)
 
-        with patch("central_storage_compute.client.urllib.request.urlopen", return_value=response) as open_url:
-            self.assertEqual(client._put_bytes("https://s3.example/part", b"data"), "")
+        with patch("central_storage_compute.client.http.client.HTTPSConnection") as factory:
+            pool.connection("https", "s3.example", None)
 
-        self.assertEqual(open_url.call_args.kwargs["timeout"], 600)
+        self.assertEqual(factory.call_args.kwargs["timeout"], 600)
+
+    def test_a_part_is_streamed_rather_than_buffered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abcdefghij")
+            client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+            client.STREAM_BLOCK_BYTES = 2
+            connection = Mock()
+            connection.getresponse.return_value = Mock(status=200, reason="OK", headers={"ETag": '"etag-1"'}, will_close=False, read=Mock(return_value=b""))
+            pool = Mock()
+            pool.connection.return_value = connection
+
+            etag = client._put_range("https://s3.example/1?sig=x", source, 4, 5, pool)
+
+            self.assertEqual(etag, "etag-1")
+            self.assertEqual(b"".join(call.args[0] for call in connection.send.call_args_list), b"efghi")
+            self.assertEqual(connection.putheader.call_args.args, ("Content-Length", "5"))
+            # Nothing larger than a block is ever resident, whatever the part size.
+            self.assertTrue(all(len(call.args[0]) <= 2 for call in connection.send.call_args_list))
+
+    def test_a_reusable_connection_is_kept_for_the_next_part(self) -> None:
+        pool = _KeepAliveConnections(60.0)
+        with patch("central_storage_compute.client.http.client.HTTPSConnection") as factory:
+            first = pool.connection("https", "s3.example", None)
+            second = pool.connection("https", "s3.example", None)
+            self.assertIs(first, second)
+            self.assertEqual(factory.call_count, 1)
+            pool.discard()
+            pool.connection("https", "s3.example", None)
+            self.assertEqual(factory.call_count, 2)
+
+    def test_a_closing_response_retires_the_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abcde")
+            client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+            connection = Mock()
+            connection.getresponse.return_value = Mock(status=200, reason="OK", headers={"ETag": '"etag-1"'}, will_close=True, read=Mock(return_value=b""))
+            pool = Mock()
+            pool.connection.return_value = connection
+
+            client._put_range("https://s3.example/1", source, 0, 5, pool)
+
+            pool.discard.assert_called_once()
 
     def test_api_url_normalises_a_common_api_prefix(self) -> None:
         client = ComputeClient("https://api.example.invalid/api/v1", "cpt_token.secret")
@@ -146,7 +194,7 @@ class ComputeClientTests(unittest.TestCase):
             source.write_bytes(b"abcde")
             client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
             client._request = Mock(side_effect=[{"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/1"}, {"partNumber": 2, "uploadUrl": "https://s3.example/2"}]}, {"fileId": "file-1"}])
-            client._put_bytes = Mock(side_effect=lambda url, _body: "etag-1" if url.endswith("/1") else "etag-2")
+            client._put_range = Mock(side_effect=lambda url, *_args: "etag-1" if url.endswith("/1") else "etag-2")
 
             result = client._upload_multipart(source, {"uploadId": "upload-1", "partSizeBytes": 3, "totalParts": 2, "maxConcurrency": 2}, None, "digest", 2)
 
@@ -204,13 +252,24 @@ class ComputeClientTests(unittest.TestCase):
             source = Path(directory) / "output.bin"
             source.write_bytes(b"abcde")
             client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
-            client._request = Mock(side_effect=[{"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/1"}]}, {"uploadId": "upload-1", "status": "CANCELLED"}])
-            client._put_bytes = Mock(side_effect=OSError("connection reset"))
+
+
+            def respond(_method: str, path: str, *_args: object, **_kwargs: object) -> dict[str, object]:
+                if path.endswith("/parts/sign"):
+                    return {"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/1"}], "expiresIn": 900}
+                return {"uploadId": "upload-1", "status": "CANCELLED"}
+
+            client._request = Mock(side_effect=respond)
+            client._put_range = Mock(side_effect=OSError("connection reset"))
 
             with patch("central_storage_compute.client.time.sleep"), self.assertRaises(RuntimeError):
                 client._upload_multipart(source, {"uploadId": "upload-1", "partSizeBytes": 8, "totalParts": 1, "maxConcurrency": 1}, None, "digest", 1)
 
-            self.assertEqual(client._request.call_args_list[-1].args[1], "/api/v1/compute/uploads/upload-1/multipart/abort")
+            paths = [call.args[1] for call in client._request.call_args_list]
+            self.assertEqual(paths[-1], "/api/v1/compute/uploads/upload-1/multipart/abort")
+            # Every retry starts from a freshly signed URL, so a signature that
+            # expired mid-transfer is never replayed.
+            self.assertEqual(sum(1 for path in paths if path.endswith("/parts/sign")), client.retry_count)
 
     def test_benchmark_respects_connection_limit_and_prefers_fewer_on_tie(self) -> None:
         client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
@@ -221,6 +280,199 @@ class ComputeClientTests(unittest.TestCase):
 
         self.assertEqual([run["connections"] for run in result["runs"]], [1, 4])
         self.assertEqual(result["recommendedConcurrency"], 1)
+
+
+class PartSignerTests(unittest.TestCase):
+    def _signer(self, client: ComputeClient, total_parts: int = 3, expires_in: float = 900.0) -> _PartSigner:
+        return _PartSigner(client, "upload-1", total_parts, expires_in)
+
+    def test_parts_are_signed_in_one_batch_and_reused(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        signer = self._signer(client)
+        with patch.object(
+            client,
+            "_request",
+            return_value={"parts": [{"partNumber": n, "uploadUrl": f"https://s3.example/{n}"} for n in (1, 2, 3)], "expiresIn": 900},
+        ) as request:
+            self.assertEqual(signer.url(1), "https://s3.example/1")
+            self.assertEqual(signer.url(2), "https://s3.example/2")
+            self.assertEqual(signer.url(3), "https://s3.example/3")
+        self.assertEqual(request.call_count, 1)
+
+    def test_a_rejected_url_is_replaced_rather_than_retried(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        signer = self._signer(client, total_parts=1)
+        responses = [
+            {"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/stale"}], "expiresIn": 900},
+            {"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/fresh"}], "expiresIn": 900},
+        ]
+        with patch.object(client, "_request", side_effect=responses):
+            stale = signer.url(1)
+            signer.invalidate(1, stale)
+            self.assertEqual(signer.url(1), "https://s3.example/fresh")
+
+    def test_invalidate_keeps_a_url_another_worker_already_refreshed(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        signer = self._signer(client, total_parts=1)
+        with patch.object(
+            client,
+            "_request",
+            return_value={"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/fresh"}], "expiresIn": 900},
+        ):
+            signer.url(1)
+            signer.invalidate(1, "https://s3.example/stale")
+            with patch.object(client, "_request", side_effect=AssertionError("must not re-sign")):
+                self.assertEqual(signer.url(1), "https://s3.example/fresh")
+
+    def test_a_url_with_too_little_life_left_is_re_signed(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        # A 150s lifetime is under the 120s floor once a part takes 60s, so the
+        # cached URL can never cover another part and must be replaced.
+        signer = self._signer(client, total_parts=1, expires_in=150.0)
+        signer.observe(60.0)
+        with patch.object(
+            client,
+            "_request",
+            return_value={"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/1"}], "expiresIn": 150},
+        ) as request:
+            signer.url(1)
+            signer.url(1)
+        self.assertEqual(request.call_count, 2)
+
+    def test_storage_rejection_is_a_retryable_error(self) -> None:
+        client = ComputeClient("https://api.example.invalid", "cpt_token.secret")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abcde")
+            connection = Mock()
+            connection.getresponse.return_value = Mock(
+                status=403, reason="Forbidden", headers={}, will_close=False,
+                read=Mock(return_value=b"<Error><Code>AccessDenied</Code></Error>"),
+            )
+            pool = Mock()
+            pool.connection.return_value = connection
+
+            with self.assertRaisesRegex(_StorageRequestError, "AccessDenied"):
+                client._put_range("https://s3.example/1", source, 0, 5, pool)
+
+
+class UploadResumeTests(unittest.TestCase):
+    def _client(self) -> ComputeClient:
+        return ComputeClient("https://api.example.invalid", "cpt_token.secret")
+
+    def test_only_the_missing_parts_are_re_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abcdef")
+            client = self._client()
+            manifest = client._upload_manifest_path(source)
+
+            def respond(_method: str, path: str, *_args: object, **_kwargs: object) -> dict[str, object]:
+                if path.endswith("/parts/sign"):
+                    return {"parts": [{"partNumber": 2, "uploadUrl": "https://s3.example/2"}], "expiresIn": 900}
+                return {"fileId": "file-1"}
+
+            client._request = Mock(side_effect=respond)
+            client._put_range = Mock(return_value="etag-2")
+
+            result = client._upload_multipart(
+                source,
+                {"uploadId": "upload-1", "partSizeBytes": 3, "totalParts": 2, "maxConcurrency": 1},
+                None,
+                "digest",
+                1,
+                {1: "etag-1"},
+                manifest,
+            )
+
+            self.assertEqual(result.file_id, "file-1")
+            # Part 1 was already in S3, so only part 2 moved.
+            self.assertEqual(client._put_range.call_count, 1)
+            completion = [call for call in client._request.call_args_list if call.args[1].endswith("/multipart/complete")][0]
+            self.assertEqual(completion.args[2]["parts"], [{"partNumber": 1, "etag": "etag-1"}, {"partNumber": 2, "etag": "etag-2"}])
+
+    def test_a_resumable_failure_keeps_the_upload_instead_of_aborting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abcde")
+            client = self._client()
+            manifest = client._upload_manifest_path(source)
+            client._request = Mock(return_value={"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/1"}], "expiresIn": 900})
+            client._put_range = Mock(side_effect=OSError("connection reset"))
+
+            with patch("central_storage_compute.client.time.sleep"), self.assertRaisesRegex(RuntimeError, "resume"):
+                client._upload_multipart(source, {"uploadId": "upload-1", "partSizeBytes": 8, "totalParts": 1, "maxConcurrency": 1}, None, "digest", 1, {}, manifest)
+
+            paths = [call.args[1] for call in client._request.call_args_list]
+            self.assertNotIn("/api/v1/compute/uploads/upload-1/multipart/abort", paths)
+
+    def test_a_completed_upload_clears_its_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abc")
+            client = self._client()
+            manifest = client._upload_manifest_path(source)
+            client._save_upload_manifest(manifest, "upload-1", 3, "digest")
+            client._request = Mock(side_effect=lambda _m, path, *_a, **_k: {"parts": [{"partNumber": 1, "uploadUrl": "https://s3.example/1"}], "expiresIn": 900} if path.endswith("/parts/sign") else {"fileId": "file-1"})
+            client._put_range = Mock(return_value="etag-1")
+
+            client._upload_multipart(source, {"uploadId": "upload-1", "partSizeBytes": 8, "totalParts": 1, "maxConcurrency": 1}, None, "digest", 1, {}, manifest)
+
+            self.assertFalse(manifest.exists())
+
+    def test_a_manifest_for_a_different_file_is_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abc")
+            client = self._client()
+            manifest = client._upload_manifest_path(source)
+            client._save_upload_manifest(manifest, "upload-1", 3, "old-digest")
+            client._request = Mock(side_effect=AssertionError("must not reach the API"))
+
+            self.assertIsNone(client._resume_multipart(manifest, 3, "new-digest"))
+            self.assertFalse(manifest.exists())
+
+    def test_resume_asks_the_api_which_parts_survived_and_renews(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abcdef")
+            client = self._client()
+            manifest = client._upload_manifest_path(source)
+            client._save_upload_manifest(manifest, "upload-1", 6, "digest")
+            client._request = Mock(side_effect=[
+                {"totalParts": 2, "partSizeBytes": 3, "parts": [{"partNumber": 1, "etag": "etag-1"}, {"partNumber": 2, "etag": None}]},
+                {"uploadId": "upload-1", "status": "UPLOADING"},
+            ])
+
+            resumed = client._resume_multipart(manifest, 6, "digest")
+
+            self.assertIsNotNone(resumed)
+            payload, completed = resumed
+            self.assertEqual(payload["uploadId"], "upload-1")
+            self.assertEqual(completed, {1: "etag-1"})
+            self.assertEqual([call.args[1] for call in client._request.call_args_list][-1], "/api/v1/compute/uploads/upload-1/renew")
+            self.assertEqual(client._request.call_args_list[-1].args[0], "POST")
+
+    def test_an_upload_the_api_no_longer_knows_starts_over(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "output.bin"
+            source.write_bytes(b"abc")
+            client = self._client()
+            manifest = client._upload_manifest_path(source)
+            client._save_upload_manifest(manifest, "upload-1", 3, "digest")
+            client._request = Mock(side_effect=ComputeApiError(404, "MULTIPART_NOT_FOUND", "gone"))
+
+            self.assertIsNone(client._resume_multipart(manifest, 3, "digest"))
+            self.assertFalse(manifest.exists())
+
+    def test_a_manifest_holds_no_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / ".output.bin.csp-upload.json"
+            ComputeClient._save_upload_manifest(manifest, "upload-1", 10, "digest")
+            recorded = manifest.read_text()
+            self.assertEqual(json.loads(recorded), {"uploadId": "upload-1", "sizeBytes": 10, "sha256": "digest"})
+            self.assertNotIn("cpt_", recorded)
+            self.assertNotIn("X-Amz-Signature", recorded)
 
 
 if __name__ == "__main__":

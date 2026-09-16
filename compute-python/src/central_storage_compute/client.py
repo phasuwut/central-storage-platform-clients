@@ -16,7 +16,7 @@ from xml.etree import ElementTree
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Lock, local
 from typing import BinaryIO
 from uuid import uuid4
 
@@ -56,6 +56,121 @@ class _RangeUnsupported(RuntimeError):
     pass
 
 
+class _StorageRequestError(RuntimeError):
+    """An S3 rejection of a presigned request, safe to retry with a fresh URL."""
+
+
+class _KeepAliveConnections:
+    """Keeps one live connection per worker thread, keyed by storage host.
+
+    Opening a connection per part costs a TCP and TLS handshake — roughly three
+    round trips — and, worse, restarts TCP slow start every time. Over a
+    long-haul link that ramp dominates the transfer, so each worker holds its
+    connection open and reuses it for every part it sends.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        self._timeout = timeout
+        self._local = local()
+
+    def connection(self, scheme: str, host: str, port: int | None) -> http.client.HTTPConnection:
+        key = (scheme, host, port)
+        held = getattr(self._local, "held", None)
+        if held is not None and held[0] == key:
+            return held[1]
+        self.discard()
+        factory = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        connection = factory(host, port, timeout=self._timeout)
+        self._local.held = (key, connection)
+        return connection
+
+    def discard(self) -> None:
+        """Drop this thread's connection; the next part opens a fresh one."""
+        held = getattr(self._local, "held", None)
+        if held is None:
+            return
+        self._local.held = None
+        try:
+            held[1].close()
+        except OSError:
+            pass
+
+
+class _PartSigner:
+    """Hands out presigned part URLs and refreshes them as they age out.
+
+    A presigned part URL lives at most as long as the compute token, which is
+    far shorter than a multi-gigabyte transfer over a high-latency link. Signing
+    every part before the first byte moves therefore guarantees that the tail of
+    a large upload is rejected. URLs are instead signed as workers reach them,
+    proactively re-signed when the remaining lifetime no longer covers a part,
+    and re-signed on demand when S3 rejects one anyway.
+    """
+
+    #: Sign ahead in blocks so a wide thread pool does not issue one call per part.
+    BATCH_SIZE = 100
+    #: Never hand out a URL with less life left than this, however fast parts are.
+    MIN_HEADROOM_SECONDS = 120.0
+
+    def __init__(self, client: "ComputeClient", upload_id: str, total_parts: int, expires_in: float) -> None:
+        self._client = client
+        self._upload_id = upload_id
+        self._total_parts = total_parts
+        self._expires_in = max(float(expires_in or 0.0), 1.0)
+        self._urls: dict[int, str] = {}
+        self._signed_at: dict[int, float] = {}
+        self._slowest_part = 0.0
+        self._lock = Lock()
+
+    def observe(self, seconds: float) -> None:
+        """Record how long a part took, so headroom tracks the real link speed."""
+        with self._lock:
+            self._slowest_part = max(self._slowest_part, seconds)
+
+    def _headroom(self) -> float:
+        # Two slow parts plus a margin: enough for the upload in hand and a retry.
+        return max(self.MIN_HEADROOM_SECONDS, self._slowest_part * 2 + 30.0)
+
+    def url(self, part_number: int) -> str:
+        with self._lock:
+            cached = self._urls.get(part_number)
+            fresh = cached is not None and (
+                time.monotonic() - self._signed_at[part_number] < self._expires_in - self._headroom()
+            )
+            if fresh:
+                return str(cached)
+        return self._sign(part_number)
+
+    def invalidate(self, part_number: int, url: str) -> None:
+        """Drop a URL S3 refused, unless another worker already replaced it."""
+        with self._lock:
+            if self._urls.get(part_number) == url:
+                self._urls.pop(part_number, None)
+                self._signed_at.pop(part_number, None)
+
+    def _sign(self, part_number: int) -> str:
+        start = ((part_number - 1) // self.BATCH_SIZE) * self.BATCH_SIZE + 1
+        numbers = list(range(start, min(start + self.BATCH_SIZE, self._total_parts + 1)))
+        response = self._client._request(
+            "POST",
+            f"/api/v1/compute/uploads/{self._upload_id}/multipart/parts/sign",
+            {"partNumbers": numbers},
+        )
+        signed_at = time.monotonic()
+        with self._lock:
+            expires_in = _as_int(response.get("expiresIn"))
+            if expires_in:
+                self._expires_in = max(float(expires_in), 1.0)
+            for item in response.get("parts", []):
+                number = int(item["partNumber"])
+                self._urls[number] = str(item["uploadUrl"])
+                self._signed_at[number] = signed_at
+            url = self._urls.get(part_number)
+        if url is None:
+            raise RuntimeError(f"The API did not sign multipart part {part_number}")
+        return url
+
+
 class ComputeClient:
     """Provider-neutral client; credentials and presigned URLs stay out of manifests/logs."""
 
@@ -68,6 +183,8 @@ class ComputeClient:
 
     # Upper bound on the backoff between completion replays.
     COMPLETE_POLL_MAX_SECONDS = 15.0
+    #: Block size used to stream a part; keeps memory flat regardless of part size.
+    STREAM_BLOCK_BYTES = 1024 * 1024
 
     def __init__(self, api_url: str, token: str, timeout: float = DEFAULT_TIMEOUT_SECONDS, retry_count: int = 3) -> None:
         if not token.startswith("cpt_"):
@@ -132,6 +249,7 @@ class ComputeClient:
         mode: str = "auto",
         max_connections: int | None = None,
         include_checksum: bool = False,
+        resume: bool = True,
     ) -> UploadResult:
         if mode not in {"auto", "single", "multipart"}:
             raise ValueError("mode must be auto, single, or multipart")
@@ -146,6 +264,11 @@ class ComputeClient:
             body["mimeType"] = mime_type or mimetypes.guess_type(path.name)[0]
         if checksum:
             body["checksum"] = checksum
+        manifest = self._upload_manifest_path(path) if resume else None
+        if manifest is not None:
+            resumed = self._resume_multipart(manifest, size, digest)
+            if resumed is not None:
+                return self._upload_multipart(path, resumed[0], checksum, digest, max_connections, resumed[1], manifest)
         payload: dict[str, object] | None = None
         if mode in {"auto", "single"}:
             try:
@@ -159,53 +282,135 @@ class ComputeClient:
             completed = self._complete(f"/api/v1/compute/uploads/{upload_id}/complete", upload_id, {"checksum": checksum} if checksum else {}, abort=False)
             return UploadResult(upload_id, str(completed["fileId"]), path, size, digest, "single")
         multipart = payload if payload is not None else self._request("POST", "/api/v1/compute/uploads/multipart/create", body)
-        return self._upload_multipart(path, multipart, checksum, digest, max_connections)
+        if manifest is not None:
+            self._save_upload_manifest(manifest, str(multipart["uploadId"]), size, digest)
+        return self._upload_multipart(path, multipart, checksum, digest, max_connections, {}, manifest)
 
-    def _upload_multipart(self, path: Path, payload: dict[str, object], checksum: str | None, digest: str, max_connections: int | None) -> UploadResult:
+    def _upload_manifest_path(self, path: Path) -> Path:
+        return path.with_name(f".{path.name}.csp-upload.json")
+
+    @staticmethod
+    def _save_upload_manifest(manifest: Path, upload_id: str, size: int, digest: str) -> None:
+        """Record which upload this file belongs to — never a token or a URL."""
+        try:
+            manifest.write_text(json.dumps({"uploadId": upload_id, "sizeBytes": size, "sha256": digest}))
+        except OSError:
+            pass  # A read-only working directory only costs the ability to resume.
+
+    @staticmethod
+    def _discard_upload_manifest(manifest: Path | None) -> None:
+        if manifest is None:
+            return
+        try:
+            manifest.unlink()
+        except OSError:
+            pass
+
+    def _resume_multipart(self, manifest: Path, size: int, digest: str) -> tuple[dict[str, object], dict[int, str]] | None:
+        """Pick an interrupted upload back up, or return None to start over.
+
+        Which parts survived is asked of the API rather than read from the
+        manifest: it reconciles its record against the parts S3 actually holds,
+        so a part lost in a crash is re-sent instead of being trusted.
+        """
+        try:
+            recorded = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(recorded, dict) or recorded.get("sizeBytes") != size or recorded.get("sha256") != digest:
+            self._discard_upload_manifest(manifest)  # A different file; its upload is not ours to resume.
+            return None
+        upload_id = str(recorded.get("uploadId") or "")
+        if not upload_id:
+            return None
+        try:
+            listed = self._request("GET", f"/api/v1/compute/uploads/{upload_id}/multipart/parts")
+            # Renewing moves a paused or failed upload back to UPLOADING so its
+            # parts can be signed again.
+            self._request("POST", f"/api/v1/compute/uploads/{upload_id}/renew", {})
+        except ComputeApiError:
+            # Expired, aborted, or raised by a token that no longer exists.
+            self._discard_upload_manifest(manifest)
+            return None
+        completed = {int(part["partNumber"]): str(part["etag"]) for part in listed.get("parts", []) if part.get("etag")}
+        payload = {
+            "uploadId": upload_id,
+            "partSizeBytes": listed.get("partSizeBytes"),
+            "totalParts": listed.get("totalParts"),
+        }
+        return payload, completed
+
+    def _upload_multipart(self, path: Path, payload: dict[str, object], checksum: str | None, digest: str, max_connections: int | None, completed: dict[int, str] | None = None, manifest: Path | None = None) -> UploadResult:
         upload_id = str(payload["uploadId"])
         part_size = _as_int(payload.get("partSizeBytes")) or 8 * 1024 * 1024
         total_parts = _as_int(payload.get("totalParts")) or ((path.stat().st_size + part_size - 1) // part_size)
         concurrency = max(1, min(int(max_connections or payload.get("maxConcurrency") or 4), 32))
-        signed: dict[int, str] = {}
-        for offset in range(0, total_parts, 500):
-            numbers = list(range(offset + 1, min(total_parts, offset + 500) + 1))
-            response = self._request("POST", f"/api/v1/compute/uploads/{upload_id}/multipart/parts/sign", {"partNumbers": numbers})
-            for item in response.get("parts", []):
-                signed[int(item["partNumber"])] = str(item["uploadUrl"])
+        done = dict(completed or {})
+        signer = _PartSigner(self, upload_id, total_parts, _as_int(payload.get("expiresIn")) or 900)
+
+        size = path.stat().st_size
+        connections = _KeepAliveConnections(self.timeout)
 
         def put(part_number: int) -> tuple[int, str]:
             start = (part_number - 1) * part_size
-            length = min(part_size, path.stat().st_size - start)
+            length = min(part_size, size - start)
             last_error: Exception | None = None
             for attempt in range(self.retry_count):
+                url = signer.url(part_number)
                 try:
-                    with path.open("rb") as source:
-                        source.seek(start)
-                        body = source.read(length)
-                    etag = self._put_bytes(signed[part_number], body)
+                    started = time.monotonic()
+                    etag = self._put_range(url, path, start, length, connections)
+                    signer.observe(time.monotonic() - started)
                     return part_number, etag
-                except (urllib.error.URLError, TimeoutError, OSError) as error:
+                except (urllib.error.URLError, TimeoutError, OSError, _StorageRequestError) as error:
                     last_error = error
+                    # An expired signature looks like any other rejection, so the
+                    # next attempt always starts from a freshly signed URL.
+                    signer.invalidate(part_number, url)
                     if attempt + 1 < self.retry_count:
                         time.sleep(min(2**attempt, 4))
             raise RuntimeError(f"Multipart part {part_number} failed") from last_error
 
+        parts: list[tuple[int, str]] = list(done.items())
+        pending = [number for number in range(1, total_parts + 1) if number not in done]
         try:
-            parts: list[tuple[int, str]] = []
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futures = [pool.submit(put, part_number) for part_number in range(1, total_parts + 1)]
-                for future in as_completed(futures):
-                    parts.append(future.result())
+                futures = [pool.submit(put, part_number) for part_number in pending]
+                try:
+                    for future in as_completed(futures):
+                        parts.append(future.result())
+                finally:
+                    # Each worker closes its own socket; the pool is thread-local.
+                    for _ in range(concurrency):
+                        pool.submit(connections.discard)
         except Exception:
-            self._abort_multipart(upload_id)
-            raise
+            if manifest is None:
+                self._abort_multipart(upload_id)
+                raise
+            # The parts already in S3 are worth more than a tidy abort: leaving
+            # the upload open lets the next call carry on from where this stopped.
+            raise RuntimeError(
+                f"Upload {upload_id} stopped with {len(parts)}/{total_parts} parts done. "
+                "Re-run the same upload to resume it, or abort it to reclaim the staged parts."
+            ) from None
 
         body = {"parts": [{"partNumber": number, "etag": etag} for number, etag in sorted(parts)], **({"checksum": checksum} if checksum else {})}
-        completed = self._complete_multipart(upload_id, body)
-        return UploadResult(upload_id, str(completed["fileId"]), path, path.stat().st_size, digest, "multipart")
+        finished = self._complete_multipart(upload_id, body)
+        self._discard_upload_manifest(manifest)
+        return UploadResult(upload_id, str(finished["fileId"]), path, path.stat().st_size, digest, "multipart")
 
     def _complete_multipart(self, upload_id: str, body: dict[str, object]) -> dict[str, object]:
         return self._complete(f"/api/v1/compute/uploads/{upload_id}/multipart/complete", upload_id, body, abort=True)
+
+    def abort_upload(self, upload_id: str, source: str | os.PathLike[str] | None = None) -> None:
+        """Give up on an interrupted upload and release its staged parts.
+
+        Pass ``source`` as well to clear that file's resume manifest, so the next
+        ``upload()`` of it starts clean instead of trying to resume.
+        """
+        self._abort_multipart(upload_id)
+        if source is not None:
+            self._discard_upload_manifest(self._upload_manifest_path(Path(source)))
 
     def _complete(self, path: str, upload_id: str, body: dict[str, object], *, abort: bool) -> dict[str, object]:
         """Complete an upload, surviving a slow finalization on the API side.
@@ -288,15 +493,50 @@ class ComputeClient:
         finally:
             connection.close()
 
-    def _put_bytes(self, url: str, body: bytes) -> str:
-        request = urllib.request.Request(url, data=body, method="PUT", headers={"Content-Length": str(len(body))})
+    def _put_range(self, url: str, path: Path, start: int, length: int, connections: _KeepAliveConnections) -> str:
+        """PUT a byte range of a file, streaming it over a reused connection.
+
+        Reading a whole part into memory would cap part size at whatever
+        ``part_size × concurrency`` a compute node can hold — the opposite of
+        what a high-latency link needs, where large parts and many connections
+        are what fill the pipe. Only a small block is resident at any time.
+        """
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("upload URL must be an HTTP(S) URL")
+        request_path = parsed.path or "/"
+        if parsed.query:
+            request_path = f"{request_path}?{parsed.query}"
+        connection = connections.connection(parsed.scheme, parsed.hostname, parsed.port)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if response.status < 200 or response.status >= 300:
-                    raise RuntimeError(f"Compute multipart upload failed ({response.status})")
-                return response.headers.get("ETag", "").strip('"')
-        except urllib.error.HTTPError as error:
-            raise _storage_api_error("Compute multipart upload", error) from error
+            connection.putrequest("PUT", request_path)
+            connection.putheader("Content-Length", str(length))
+            connection.endheaders()
+            remaining = length
+            with path.open("rb") as source:
+                source.seek(start)
+                while remaining > 0:
+                    chunk = source.read(min(self.STREAM_BLOCK_BYTES, remaining))
+                    if not chunk:
+                        raise _StorageRequestError(f"File ended {remaining} bytes before the part was complete")
+                    connection.send(chunk)
+                    remaining -= len(chunk)
+            response = connection.getresponse()
+            body = response.read()
+            if response.will_close:
+                connections.discard()
+            if response.status < 200 or response.status >= 300:
+                connections.discard()
+                error = urllib.error.HTTPError(url, response.status, response.reason, response.headers, io.BytesIO(body))
+                raise _storage_api_error("Compute multipart upload", error)
+            return response.headers.get("ETag", "").strip('"')
+        except (OSError, http.client.HTTPException) as error:
+            # A half-used or stale socket cannot be handed to the next part.
+            connections.discard()
+            raise _StorageRequestError("Compute multipart upload request failed") from error
+        except BaseException:
+            connections.discard()
+            raise
 
     def _download_normal(self, file_id: str, target: Path, url: str, expected_size: int | None, verify_sha256: str | None) -> DownloadResult:
         last_error: Exception | None = None
@@ -475,7 +715,7 @@ def _safe_error_text(value: object, fallback: str) -> str:
     return text
 
 
-def _storage_api_error(operation: str, error: urllib.error.HTTPError) -> RuntimeError:
+def _storage_api_error(operation: str, error: urllib.error.HTTPError) -> _StorageRequestError:
     """Expose only an S3 error code/request ID, never the presigned URL or body."""
     code = "HTTP_ERROR"
     request_id = _safe_error_text(error.headers.get("x-amz-request-id"), "") or None
@@ -486,7 +726,7 @@ def _storage_api_error(operation: str, error: urllib.error.HTTPError) -> Runtime
     except (ElementTree.ParseError, UnicodeDecodeError, OSError):
         pass
     detail = f"{operation} failed ({error.code}): {code}"
-    return RuntimeError(f"{detail} [request ID: {request_id}]" if request_id else detail)
+    return _StorageRequestError(f"{detail} [request ID: {request_id}]" if request_id else detail)
 
 
 def _safe_storage_error_code(value: object, fallback: str) -> str:

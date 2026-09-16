@@ -25,6 +25,14 @@ client = ComputeClient("https://api.example.invalid", token="cpt_<show-once-toke
 
 Pass the API origin only (for example, `https://central-storage-platform-api.phasuwut.com`). Do not include `/api/v1`, `/compute`, a route, or `*`; the client supplies the API path itself. Storage upload failures report only a safe S3 error code and request ID, never a presigned URL.
 
+An interrupted multipart upload is resumed by default: the client records which upload a file belongs to and, on the next `upload()` of that same file, asks the API which parts S3 actually holds and sends only what is missing. A part failure therefore leaves the upload open rather than aborting it. To give up instead and release the staged parts, call `client.abort_upload(upload_id, source)`; resume is bounded by the compute token that created the upload, so a token that has expired starts the transfer over. Pass `resume=False` to always start clean.
+
+Multipart part URLs are signed as the transfer reaches them and re-signed whenever their remaining lifetime no longer covers a part or S3 rejects one, so an upload that outlives a presigned URL continues instead of failing at the tail. Raise `max_connections` for a long-haul link — a single TCP stream to a distant region is limited by round-trip time, not bandwidth, so parallel parts are what make a multi-gigabyte upload finish inside the token's lifetime:
+
+```python
+upload = client.upload("./model.zip", destination="models/", mode="multipart", max_connections=32)
+```
+
 `download(mode="auto")` follows the transfer mode and concurrency returned by the API. Use `mode="parallel"` to request bounded HTTP Range workers; the client falls back to streaming mode when the storage endpoint does not support ranges. `upload(mode="auto")` tries the single path and switches to the token-scoped multipart path when the API requires it.
 
 The token is supplied at runtime. The client never writes it or a presigned URL to a resume manifest or log. Resume manifests contain only file identity, expected size/checksum and completed byte ranges. All upload completion calls carry a fresh `Idempotency-Key`. Upload checksums are disabled by default for compatibility with S3-compatible presigned PUT endpoints; pass `include_checksum=True` only when the target bucket supports signed `x-amz-checksum-sha256` headers.
